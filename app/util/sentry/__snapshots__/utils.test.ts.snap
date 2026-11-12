@@ -228,10 +228,10 @@ exports[`captureSentryFeedback maskObject masks initial root state fixture 1`] =
     },
   },
   "sdk": {
-    "approvedHosts": {},
+    "approvedHosts": "object",
     "connections": {},
-    "dappConnections": {},
-    "wc2Metadata": undefined,
+    "dappConnections": "object",
+    "wc2Metadata": "undefined",
   },
   "security": {
     "allowLoginWithRememberMe": false,

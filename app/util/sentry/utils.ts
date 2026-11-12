@@ -211,7 +211,25 @@ export const sentryStateMask = {
   onboarding: true,
   privacy: true,
   rpcEvents: true,
-  sdk: true,
+  sdk: {
+    // Allowlist only: connections hold the ECIES privateKey, peer public key,
+    // channel ID and dapp origin, none of which may be sent to Sentry.
+    connections: {
+      [AllProperties]: {
+        protocolVersion: true,
+        connected: true,
+        validUntil: true,
+        relayPersistence: true,
+        initialConnection: true,
+        lastAuthorized: true,
+        trigger: true,
+      },
+    },
+    approvedHosts: false,
+    dappConnections: false,
+    v2Connections: false,
+    wc2Metadata: false,
+  },
   security: true,
   settings: true,
   smartTransactions: true,
