@@ -92,6 +92,64 @@ const expoUpdatesMockValues: {
 
 jest.mock('expo-updates', () => expoUpdatesMockValues);
 
+const MOCK_SDK_PRIVATE_KEY =
+  '0x1f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a7988';
+const MOCK_SDK_OTHER_PUBLIC_KEY =
+  '0x04aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44';
+const MOCK_SDK_CHANNEL_ID = 'c0ffee00-1234-4abc-9def-000000000001';
+const MOCK_SDK_ORIGIN = 'https://dapp.example.com';
+
+const createSdkStateWithSecrets = () => ({
+  connections: {
+    [MOCK_SDK_CHANNEL_ID]: {
+      id: MOCK_SDK_CHANNEL_ID,
+      otherPublicKey: MOCK_SDK_OTHER_PUBLIC_KEY,
+      privateKey: MOCK_SDK_PRIVATE_KEY,
+      origin: MOCK_SDK_ORIGIN,
+      originatorInfo: {
+        url: MOCK_SDK_ORIGIN,
+        title: 'Example dApp',
+        anonId: 'anon-id',
+      },
+      protocolVersion: 2,
+      connected: true,
+      relayPersistence: true,
+      validUntil: 1700000000000,
+      lastAuthorized: 1690000000000,
+    },
+  },
+  approvedHosts: { [MOCK_SDK_CHANNEL_ID]: 1700000000000 },
+  dappConnections: {
+    [MOCK_SDK_CHANNEL_ID]: {
+      id: MOCK_SDK_CHANNEL_ID,
+      otherPublicKey: MOCK_SDK_OTHER_PUBLIC_KEY,
+      privateKey: MOCK_SDK_PRIVATE_KEY,
+      origin: MOCK_SDK_ORIGIN,
+    },
+  },
+  v2Connections: {
+    [MOCK_SDK_CHANNEL_ID]: {
+      id: MOCK_SDK_CHANNEL_ID,
+      otherPublicKey: MOCK_SDK_OTHER_PUBLIC_KEY,
+      privateKey: MOCK_SDK_PRIVATE_KEY,
+      origin: MOCK_SDK_ORIGIN,
+    },
+  },
+  wc2Metadata: {
+    id: 'wc2-id',
+    url: MOCK_SDK_ORIGIN,
+    name: 'Example dApp',
+    icon: '',
+  },
+});
+
+const expectNoSdkSecrets = (maskedState: unknown) => {
+  const serialized = JSON.stringify(maskedState);
+  expect(serialized).not.toContain(MOCK_SDK_PRIVATE_KEY);
+  expect(serialized).not.toContain(MOCK_SDK_OTHER_PUBLIC_KEY);
+  expect(serialized).not.toContain(MOCK_SDK_ORIGIN);
+};
+
 describe('deriveSentryEnvironment', () => {
   it('returns flask-production for non-dev production environment and flask build type', async () => {
     const METAMASK_ENVIRONMENT = 'production';
@@ -781,6 +839,36 @@ describe('captureSentryFeedback', () => {
       expect(typeof secondKeyring.accounts).toBe('object');
       expect(Object.keys(secondKeyring.accounts).length).toBe(0);
     });
+
+    it('never includes SDK connection secrets such as privateKey', () => {
+      const maskedState = maskObject(
+        { ...rootState, sdk: createSdkStateWithSecrets() },
+        sentryStateMask,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ) as any;
+
+      expectNoSdkSecrets(maskedState);
+      expect(maskedState.sdk).toEqual({
+        connections: {
+          [MOCK_SDK_CHANNEL_ID]: {
+            id: 'string',
+            otherPublicKey: 'string',
+            privateKey: 'string',
+            origin: 'string',
+            originatorInfo: 'object',
+            protocolVersion: 2,
+            connected: true,
+            relayPersistence: true,
+            validUntil: 1700000000000,
+            lastAuthorized: 1690000000000,
+          },
+        },
+        approvedHosts: 'object',
+        dappConnections: 'object',
+        v2Connections: 'object',
+        wc2Metadata: 'object',
+      });
+    });
   });
 
   it('handle root state with value null and mask false', () => {
@@ -1109,6 +1197,25 @@ describe('rewriteReport', () => {
     };
 
     expect(() => rewriteReport(report)).toThrow('Store error');
+  });
+
+  it('does not attach SDK connection privateKey to the report appState', () => {
+    mockStore.getState.mockReturnValue({
+      sdk: createSdkStateWithSecrets(),
+    } as unknown as RootState);
+
+    const report = {
+      contexts: {},
+    };
+
+    const result = rewriteReport(report);
+
+    expectNoSdkSecrets(result.contexts?.appState);
+    expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (result.contexts?.appState as any).sdk.connections[MOCK_SDK_CHANNEL_ID]
+        .privateKey,
+    ).toBe('string');
   });
 });
 
