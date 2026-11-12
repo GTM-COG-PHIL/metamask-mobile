@@ -48,6 +48,7 @@ import { getRpcMethodMiddleware } from '../../../core/RPCMethods/RPCMethodMiddle
 import downloadFile from '../../../util/browser/downloadFile';
 import { MAX_MESSAGE_LENGTH } from '../../../constants/dapp';
 import sanitizeUrlInput from '../../../util/url/sanitizeUrlInput';
+import { isSameOrigin } from '../../../util/url';
 import {
   getPermittedCaipAccountIdsByHostname,
   getPermittedEvmAddressesByHostname,
@@ -184,6 +185,8 @@ export const BrowserTab: React.FC<BrowserTabProps> = React.memo(
     const resolvedUrlRef = useRef('');
     // Tracks currently loading URL to prevent phishing alerts when user navigates away from malicious sites before detection completes
     const loadingUrlRef = useRef('');
+    // Incremented on every main-frame load start so stale async phishing checks can be ignored
+    const loadStartIdRef = useRef(0);
     const submittedUrlRef = useRef('');
     const titleRef = useRef<string>('');
     const iconRef = useRef<ImageSourcePropType | undefined>();
@@ -889,7 +892,28 @@ export const BrowserTab: React.FC<BrowserTabProps> = React.memo(
             return;
           }
           if (dataParsed.name) {
-            backgroundBridgeRef.current?.onMessage(dataParsed);
+            // The page controls `dataParsed.origin`; attribute the message to the
+            // origin the WebView natively reports instead.
+            const senderOrigin = nativeEvent.url
+              ? new URLParse(nativeEvent.url).origin
+              : '';
+            if (!senderOrigin || senderOrigin === 'null') {
+              return;
+            }
+            if (
+              dataParsed.origin !== undefined &&
+              !isSameOrigin(String(dataParsed.origin), senderOrigin)
+            ) {
+              console.warn(
+                '[BrowserTab]: message dropped, declared origin does not match WebView origin',
+                senderOrigin,
+              );
+              return;
+            }
+            backgroundBridgeRef.current?.onMessage({
+              ...dataParsed,
+              origin: senderOrigin,
+            });
             return;
           }
         } catch (e: unknown) {
@@ -982,6 +1006,12 @@ export const BrowserTab: React.FC<BrowserTabProps> = React.memo(
     const onLoadStart = useCallback(
       async ({ nativeEvent }: WebViewNavigationEvent) => {
         loadingUrlRef.current = nativeEvent.url;
+        const loadStartId = ++loadStartIdRef.current;
+
+        // Drop the previous origin's bridge before any await so the new page
+        // can never talk to it while the phishing check is pending or blocked.
+        backgroundBridgeRef.current?.onDisconnect();
+        backgroundBridgeRef.current = undefined;
 
         // Use URL to produce real url. This should be the actual website that the user is viewing.
         const { origin: urlOrigin } = new URLParse(nativeEvent.url);
@@ -1009,9 +1039,17 @@ export const BrowserTab: React.FC<BrowserTabProps> = React.memo(
 
         // Cancel loading the page if we detect its a phishing page
         const isAllowed = await isAllowedOrigin(urlOrigin);
+        const isLatestLoad = loadStartId === loadStartIdRef.current;
         if (!isAllowed) {
+          if (isLatestLoad) {
+            webviewRef.current?.stopLoading();
+          }
           handleNotAllowedUrl(urlOrigin);
           return false;
+        }
+
+        if (!isLatestLoad) {
+          return;
         }
 
         sendActiveAccount(nativeEvent.url);

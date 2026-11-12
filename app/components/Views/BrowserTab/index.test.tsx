@@ -1,13 +1,35 @@
 import React from 'react';
-import { fireEvent, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react-native';
 import AppConstants from '../../../core/AppConstants';
 import renderWithProvider from '../../../util/test/renderWithProvider';
 import { backgroundState } from '../../../util/test/initial-root-state';
 import { MOCK_ACCOUNTS_CONTROLLER_STATE } from '../../../util/test/accountsControllerTestUtils';
 import BrowserTab from './BrowserTab';
 import Routes from '../../../constants/navigation/Routes';
+import { getPhishingTestResultAsync } from '../../../util/phishingDetection';
 
 const mockInjectJavaScript = jest.fn();
+const mockStopLoading = jest.fn();
+
+interface MockBridge {
+  url: string;
+  onMessage: jest.Mock;
+  onDisconnect: jest.Mock;
+}
+const mockBridges: MockBridge[] = [];
+
+jest.mock('../../../core/BackgroundBridge/BackgroundBridge', () =>
+  jest.fn().mockImplementation(({ url }: { url: string }) => {
+    const bridge = {
+      url,
+      onMessage: jest.fn(),
+      onDisconnect: jest.fn(),
+      sendNotificationEip1193: jest.fn(),
+    };
+    mockBridges.push(bridge);
+    return bridge;
+  }),
+);
 
 jest.mock('@metamask/react-native-webview', () => {
   const { View } = jest.requireActual('react-native');
@@ -17,6 +39,7 @@ jest.mock('@metamask/react-native-webview', () => {
     (props: Record<string, unknown>, ref: React.Ref<unknown>) => {
       ActualReact.useImperativeHandle(ref, () => ({
         injectJavaScript: mockInjectJavaScript,
+        stopLoading: mockStopLoading,
       }));
       return <View {...props} />;
     },
@@ -86,6 +109,9 @@ jest.mock('../../../core/Engine', () => ({
     CurrencyRateController: {
       updateExchangeRate: jest.fn(),
     },
+    PermissionController: {
+      state: { subjects: {} },
+    },
   },
 }));
 
@@ -137,6 +163,7 @@ describe('BrowserTab', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockInjectJavaScript.mockClear();
+    mockBridges.length = 0;
   });
 
   it('render Browser', async () => {
@@ -357,6 +384,178 @@ describe('BrowserTab', () => {
       });
 
       expect(mockInjectJavaScript).not.toHaveBeenCalled();
+    });
+  });
+  describe('provider bridge origin', () => {
+    const TRUSTED_URL = 'https://trusted.example/';
+    const PHISHING_URL = 'https://phishing.example/';
+
+    const renderAndGetWebView = async () => {
+      renderWithProvider(<BrowserTab {...mockProps} />, {
+        state: mockInitialState,
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId('browser-webview')).toBeVisible(),
+      );
+      return screen.getByTestId('browser-webview');
+    };
+
+    const loadStart = async (
+      webView: ReturnType<typeof screen.getByTestId>,
+      url: string,
+    ) => {
+      await act(async () => {
+        await webView.props.onLoadStart({ nativeEvent: { url } });
+      });
+    };
+
+    const providerMessage = (origin: string) =>
+      JSON.stringify({
+        name: 'metamask-provider',
+        origin,
+        data: { method: 'personal_sign' },
+      });
+
+    it('forwards provider messages with the origin reported by the WebView', async () => {
+      const webView = await renderAndGetWebView();
+      await loadStart(webView, TRUSTED_URL);
+
+      webView.props.onMessage({
+        nativeEvent: {
+          url: TRUSTED_URL,
+          data: providerMessage(TRUSTED_URL),
+        },
+      });
+
+      expect(mockBridges).toHaveLength(1);
+      expect(mockBridges[0].onMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'metamask-provider',
+          origin: 'https://trusted.example',
+        }),
+      );
+    });
+
+    it('drops provider messages whose declared origin does not match the WebView origin', async () => {
+      const webView = await renderAndGetWebView();
+      await loadStart(webView, TRUSTED_URL);
+
+      webView.props.onMessage({
+        nativeEvent: {
+          url: PHISHING_URL,
+          data: providerMessage(TRUSTED_URL),
+        },
+      });
+
+      expect(mockBridges[0].onMessage).not.toHaveBeenCalled();
+    });
+
+    it('overrides a missing declared origin with the WebView origin', async () => {
+      const webView = await renderAndGetWebView();
+      await loadStart(webView, TRUSTED_URL);
+
+      webView.props.onMessage({
+        nativeEvent: {
+          url: PHISHING_URL,
+          data: JSON.stringify({ name: 'metamask-provider', data: {} }),
+        },
+      });
+
+      expect(mockBridges[0].onMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ origin: 'https://phishing.example' }),
+      );
+    });
+
+    it('disconnects the previous bridge before the phishing check resolves', async () => {
+      const webView = await renderAndGetWebView();
+      await loadStart(webView, TRUSTED_URL);
+      const trustedBridge = mockBridges[0];
+
+      let resolvePhishingCheck: (value: unknown) => void = () => undefined;
+      (getPhishingTestResultAsync as jest.Mock).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePhishingCheck = resolve;
+          }),
+      );
+
+      let pendingLoad: Promise<unknown> = Promise.resolve();
+      act(() => {
+        pendingLoad = webView.props.onLoadStart({
+          nativeEvent: { url: PHISHING_URL },
+        });
+      });
+
+      expect(trustedBridge.onDisconnect).toHaveBeenCalledTimes(1);
+
+      webView.props.onMessage({
+        nativeEvent: {
+          url: PHISHING_URL,
+          data: providerMessage(TRUSTED_URL),
+        },
+      });
+      expect(trustedBridge.onMessage).not.toHaveBeenCalled();
+
+      await act(async () => {
+        resolvePhishingCheck({ result: false, name: '' });
+        await pendingLoad;
+      });
+      expect(mockBridges).toHaveLength(2);
+      expect(mockBridges[1].url).toBe('https://phishing.example');
+    });
+
+    it('stops loading and does not create a bridge for blocked pages', async () => {
+      const webView = await renderAndGetWebView();
+      await loadStart(webView, TRUSTED_URL);
+      const trustedBridge = mockBridges[0];
+
+      (getPhishingTestResultAsync as jest.Mock).mockResolvedValueOnce({
+        result: true,
+        name: 'phishing',
+      });
+      await loadStart(webView, PHISHING_URL);
+
+      expect(mockStopLoading).toHaveBeenCalled();
+      expect(trustedBridge.onDisconnect).toHaveBeenCalledTimes(1);
+      expect(mockBridges).toHaveLength(1);
+
+      webView.props.onMessage({
+        nativeEvent: {
+          url: PHISHING_URL,
+          data: providerMessage(TRUSTED_URL),
+        },
+      });
+      expect(trustedBridge.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('ignores a stale phishing check from a superseded navigation', async () => {
+      const webView = await renderAndGetWebView();
+
+      let resolveStaleCheck: (value: unknown) => void = () => undefined;
+      (getPhishingTestResultAsync as jest.Mock).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveStaleCheck = resolve;
+          }),
+      );
+      let staleLoad: Promise<unknown> = Promise.resolve();
+      act(() => {
+        staleLoad = webView.props.onLoadStart({
+          nativeEvent: { url: PHISHING_URL },
+        });
+      });
+
+      await loadStart(webView, TRUSTED_URL);
+      mockStopLoading.mockClear();
+
+      await act(async () => {
+        resolveStaleCheck({ result: false, name: '' });
+        await staleLoad;
+      });
+
+      expect(mockStopLoading).not.toHaveBeenCalled();
+      expect(mockBridges).toHaveLength(1);
+      expect(mockBridges[0].url).toBe('https://trusted.example');
     });
   });
 });
